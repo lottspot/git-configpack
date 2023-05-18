@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -e
 
-usage_spec="\
+install_usage_spec="\
 install.sh [options]
 
 install script for %pack_name% package
 --
   Options:
 h,help                   show the help
+version                  print the version number and exit
 uninstall                remove an installation created by this script
 reinstall                perform an uninstall -> install sequence
 c,reconfigure            (re-)create git config includes of sources in configsdir
-l,list-properties        list all install.properties values
+i,list-properties        list all install.properties values
 k,get-property=key       lookup an install.properties value
 p,with-property=key-val  override an install.properties value for this invocation
 "
@@ -36,9 +37,10 @@ assert_inputs_valid()
 
 default_package_name()
 {
-  local pack_basename=$(basename "$PACKDIR")
+  local packdir=$1
+  local pack_basename=$(basename "$packdir")
   if [[ $pack_basename =~ ^\.+$ ]]; then
-    pack_basename=$(basename "$(cd "$PACKDIR" && pwd)")
+    pack_basename=$(basename "$(cd "$packdir" && pwd)")
   fi
   local pack_name=${pack_basename#.}
   pack_name=${pack_name#git-}
@@ -48,41 +50,101 @@ default_package_name()
 property_get()
 {
   local prop_name=$1
-  printf '%s\n' "${properties[$prop_name]}" | tail -n1
+  printf '%s\n' "${PROPERTIES[$prop_name]}" | tail -n1
 }
 
 property_get_all()
 {
   local prop_name=$1
-  printf '%s\n' "${properties[$prop_name]}"
+  printf '%s\n' "${PROPERTIES[$prop_name]}"
+}
+
+property_set()
+{
+  local prop_key=$1
+  local prop_val=$2
+  PROPERTIES[$prop_key]=$prop_val
 }
 
 property_add()
 {
   local prop_key=$1
   local prop_val=$2
-  if [[ ${properties[$prop_key]} ]]; then
-    properties[$prop_key]=$(printf '%s\n%s\n' "${properties[$prop_key]}" "$prop_val")
+  if [[ ${PROPERTIES[$prop_key]} ]]; then
+    PROPERTIES[$prop_key]=$(printf '%s\n%s\n' "${PROPERTIES[$prop_key]}" "$prop_val")
   else
-    properties[$prop_key]=$prop_val
+    PROPERTIES[$prop_key]=$prop_val
   fi
 }
 
-load_properties()
+properties_load()
 {
-  frompath=$1
-  while read prop_key prop_val; do
-    test "$prop_key" || continue
-    property_add "$prop_key" "$prop_val"
-  done <<< "$(git config -f "$frompath" --get-regexp '.*')"
+  for loadpath in "$@"; do
+    while read prop_key prop_val; do
+      test "$prop_key" || continue
+      property_add "$prop_key" "$prop_val"
+    done <<< "$(git config -f "$loadpath" --get-regexp '.*')"
+  done
 }
+
+properties_write()
+{
+  local dest=$1
+  mkdir -p "$(dirname "$dest")"
+  printf '# %s %s\n' 'vim:' 'filetype=gitconfig:' > "$dest"
+  for property in "${!PROPERTIES[@]}"; do
+    local var=$property
+    local val=${PROPERTIES[$property]}
+    git config -f "$dest" "$var" "$val"
+  done
+  printf '+ %s\n' "${PACK_PROPERTIES_PATH#$PACK_PATH/}"
+}
+
+properties_dump()
+{
+  for prop_name in "${!PROPERTIES[@]}"; do
+    printf '%s %s\n' "$prop_name" "${PROPERTIES[$prop_name]}";
+  done
+}
+
+properties_list()
+{
+  local awk_prog='
+BEGIN {
+  maxlen=0
+}
+{
+  fieldlen=length($1)
+  if (fieldlen > maxlen) maxlen=fieldlen
+  field[NR]=$1
+  val[NR]=substr($0, fieldlen+2)
+}
+END {
+  fstr = sprintf("%%-%ds  %%s\n", maxlen)
+  for (i = 1; i <= NR; i++) printf(fstr, field[i], val[i])
+}
+'
+awk "$awk_prog" <<< "$(properties_dump)"
+}
+
+declare -A PROPERTIES
+
+if [[ $0 != $BASH_SOURCE ]]; then
+  PACKDIR=$(dirname "$BASH_SOURCE")
+  if readlink "$PACKDIR" &>/dev/null; then
+    PACKDIR=$(readlink "$PACKDIR")
+  fi
+  ABSPACKDIR=$(cd "$PACKDIR" && pwd)
+  INSTALLDIR=$(git %pack_name%-installdir 2>/dev/null || true)
+  return 0
+fi
 
 write_gitconfig()
 {
   while read config_path; do
     test "$config_path" || continue
     config_path=$(sed 's|/./|/|g' <<< "$config_path")
-    path_args=("$config_path")
+    local path_args=("$config_path")
     if ! grep -- '--unset' &>/dev/null <<< "$*"; then
       path_args+=("$config_path")
     fi
@@ -112,6 +174,7 @@ mode_install()
 
 mode_uninstall()
 {
+  local was_installed=
   while read hook; do
     ( eval "$hook" )
   done <<< "$(property_get_all 'uninstall.pre')"
@@ -136,25 +199,28 @@ mode_uninstall()
   done <<< "$(property_get_all 'uninstall.post')"
 }
 
-mode_list_properties()
+pack_is_template()
 {
-  local properties_table=$(for prop_name in "${!properties[@]}"; do printf '%s %s\n' "$prop_name" "${properties[$prop_name]}"; done)
-  local awk_prog='
-BEGIN {
-  maxlen=0
+  if grep '[%]pack_name[%]' <<< "${PROPERTIES['package.name']}" >/dev/null; then
+    return 0
+  else
+    return 1
+  fi
 }
+
+pack_rename()
 {
-  fieldlen=length($1)
-  if (fieldlen > maxlen) maxlen=fieldlen
-  field[NR]=$1
-  val[NR]=substr($0, fieldlen+2)
-}
-END {
-  fstr = sprintf("%%-%ds  %%s\n", maxlen)
-  for (i = 1; i <= NR; i++) printf(fstr, field[i], val[i])
-}
-'
-  awk "$awk_prog" <<< "$properties_table"
+  local new_name=$1
+  local packrename_dir=$PACKDIR/.packrename
+  find "$PACKDIR" -type f ! -path '*/.*' -exec sed -i.packrename -e "s/[%]pack_name[%]/$new_name/g" {} +
+  find "$PACKDIR" -type f -name '*.packrename' | while read packrename_src; do
+    packrename_stem=${packrename_src#$PACKDIR}
+    packrename_base=${packrename_stem%.packrename}
+    packrename_dest=$packrename_dir/$packrename_base
+    mkdir -p "$(dirname "$packrename_dest")"
+    mv "$packrename_src" "$packrename_dest"
+    printf '+ %s\n' "$packrename_dest"
+  done
 }
 
 PACKDIR=$(dirname "$0")
@@ -166,22 +232,28 @@ fi
 ABSPACKDIR=$(cd "$PACKDIR" && pwd)
 INSTALLDIR=
 properties_path=$PACKDIR/install.properties
-declare -A properties
 declare -A default_properties=(
-  [package.name]=$(default_package_name)
+  [package.name]=$(default_package_name "$PACKDIR")
   [package.configsdir]=.
   [install.mode]=static-local
 )
 
 if [[ -e $properties_path ]]; then
-  load_properties "$properties_path"
+  properties_load "$properties_path"
 fi
+
+usage_spec="\
+$install_usage_spec
+$(if pack_is_template; then printf '\n  %s\n' 'Template options:'; fi)
+$(if pack_is_template; then printf '%s\n' 'r,rename=new-name rename this template into a package'; fi)
+"
 
 eval "$(git rev-parse --parseopt --stuck-long -- "$@" <<< "$usage_spec" || echo exit $?)"
 until [[ $1 == '--' ]]; do
   opt_name=${1%%=*}
   opt_arg=${1#*=}
   case $opt_name in
+    --version         ) printf '%pack_name%: packaged with git-configpack version %s\n' '%pack_version%'; exit 0;;
     --reconfigure     ) modes+=(reconfigure)       ;;
     --uninstall       ) modes+=(uninstall)         ;;
     --reinstall       ) modes+=(uninstall install) ;;
@@ -195,14 +267,15 @@ until [[ $1 == '--' ]]; do
       propval=${opt_arg#*=}
       property_add "$propkey" "$propval"
     ;;
+    --rename          ) pack_rename "$opt_arg" && exit $?;;
   esac
   shift
 done
 
 for prop_name in "${!default_properties[@]}"; do
   prop_val=${default_properties[$prop_name]}
-  if [[ ! ${properties[$prop_name]} ]]; then
-    properties[$prop_name]=$prop_val
+  if [[ ! ${PROPERTIES[$prop_name]} ]]; then
+    PROPERTIES[$prop_name]=$prop_val
   fi
 done
 
@@ -218,6 +291,7 @@ GIT_CONFIG_OPTS=()
 case $INSTALL_MODE in
   local)
     INSTALLDIR=$(git rev-parse --git-path "$PACKAGE_NAME")
+    GIT_CONFIG_OPTS+=(--local)
   ;;
   global)
     INSTALLDIR=$HOME/.local/share/git-$PACKAGE_NAME
@@ -225,6 +299,7 @@ case $INSTALL_MODE in
   ;;
   static-local)
     INSTALLDIR=$PACKDIR
+    GIT_CONFIG_OPTS+=(--local)
   ;;
   static-global)
     INSTALLDIR=$PACKDIR
@@ -242,7 +317,7 @@ for mode in "${modes[@]}"; do
     install         ) mode_install                      ;;
     uninstall       ) mode_uninstall                    ;;
     reconfigure     ) write_gitconfig                   ;;
-    list-properties ) mode_list_properties              ;;
+    list-properties ) properties_list                   ;;
     get-property    ) property_get_all "$get_prop_name" ;;
   esac
 done

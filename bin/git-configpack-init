@@ -2,13 +2,14 @@
 set -e
 
 usage_spec="\
-git configpack init [-n|--name] [PATH]
+git configpack init [options] [-n|--name] [PATH]
 
 Create skeleton for a new configpack project
 --
 h,help              show the help
 n,name=             package name (defaults to directory name)
 p,property=key-val  install property
+t,template          convenience option for: -n %pack_name
 "
 
 die(){
@@ -16,47 +17,28 @@ die(){
   exit 1
 }
 
-default_package_name()
-{
-  local for_path=$1
-  local pack_basename=$(basename "$for_path")
-  if [[ $pack_basename =~ ^\.+$ ]]; then
-    pack_basename=$(basename "$(cd "$for_path" && pwd)")
-  fi
-  local pack_name=${pack_basename#.}
-  pack_name=${pack_name#git-}
-  printf '%s\n' "$pack_name"
-}
-
-write_properties()
-{
-  local dest=$1
-  mkdir -p "$(dirname "$dest")"
-  printf '# %s %s\n' 'vim:' 'filetype=gitconfig:' > "$dest"
-  for property in "${!properties[@]}"; do
-    var=$property
-    val=${properties[$property]}
-    git config -f "$dest" "$var" "$val"
-  done
-  printf '+ %s\n' "${pack_properties_path#$pack_path/}"
-}
-
 copy_resource()
 {
   local name=$1
   local destpath=$2
-  local srcpath=$resource_home/$name
+  local srcpath=$RESOURCE_HOME/$name
   mkdir -p "$(dirname "$destpath")"
-  sed -e "s/%pack_name%/${properties['package.name']}/g" < "$srcpath" > "$destpath"
+  sed                                                  \
+    -e "s/%pack_name%/${PROPERTIES['package.name']}/g" \
+    -e "s/%pack_version%/$(cat "$DISTDIR/VERSION")/g"  < "$srcpath" > "$destpath"
   if [[ $(find "$srcpath" -prune -perm -00100 2>/dev/null) ]]; then
     chmod +x "$destpath"
   fi
-  printf '+ %s\n' "${destpath#$pack_path/}"
+  printf '+ %s\n' "${destpath#$PACK_PATH/}"
 }
 
-declare -A properties
-
 eval "$(git rev-parse --parseopt --stuck-long -- "$@" <<< "$usage_spec" || echo exit $?)"
+
+if [[ ! $DISTDIR ]]; then
+  die 'DISTDIR not provided'
+fi
+
+source "$DISTDIR"/share/install.sh
 
 # Parse options
 until [[ $1 == '--' ]]; do
@@ -67,8 +49,9 @@ until [[ $1 == '--' ]]; do
     --property ) 
       propkey=${opt_arg%%=*}
       propval=${opt_arg#*=}
-      properties[$propkey]=$propval
+      PROPERTIES[$propkey]=$propval
     ;;
+  --template  ) pack_is_template=1;;
   esac
   shift
 done
@@ -76,16 +59,12 @@ done
 shift
 
 # Parse operands
-pack_path=${1:-.}
+PACK_PATH=${1:-.}
 
 # Program run
 
-if [[ ! $DISTDIR ]]; then
-  die 'DISTDIR not provided'
-fi
-
-pack_properties_path=$pack_path/install.properties
-resource_home=$DISTDIR/share
+PACK_PROPERTIES_PATH=$PACK_PATH/install.properties
+RESOURCE_HOME=$DISTDIR/share
 
 declare -A configs=(
   [core]=core.gitconfig
@@ -101,38 +80,42 @@ declare -A default_properties=(
 )
 
 if [[ $pack_name ]]; then
-  properties['package.name']=$pack_name
+  PROPERTIES['package.name']=$pack_name
 fi
 
-if [[ ! ${properties['package.name']} ]]; then
-  properties['package.name']=$(default_package_name "$pack_path")
+if [[ $pack_is_template ]]; then
+  PROPERTIES['package.name']=%pack_name%
+fi
+
+if [[ ! ${PROPERTIES['package.name']} ]]; then
+  PROPERTIES['package.name']=$(default_package_name "$PACK_PATH")
 fi
 
 for default_name in "${!default_properties[@]}"; do
   default_val=${default_properties[$default_name]}
-  if [[ ! ${properties[$default_name]} ]]; then
-    properties[$default_name]=$default_val
+  if [[ ! ${PROPERTIES[$default_name]} ]]; then
+    PROPERTIES[$default_name]=$default_val
   fi
 done
 
 # validate install.mode value
-install_mode=${properties['install.mode']}
+install_mode=${PROPERTIES['install.mode']}
 if [[ $install_mode ]]; then
-  $resource_home/install.sh --with-property "install.mode=$install_mode" --get-property install.mode >/dev/null
+  $RESOURCE_HOME/install.sh --with-property "install.mode=$install_mode" --get-property install.mode >/dev/null
 fi
 
-if [[ ! -e $pack_properties_path ]]; then
-  write_properties "$pack_properties_path"
+if [[ ! -e $PACK_PROPERTIES_PATH ]]; then
+  properties_write "$PACK_PROPERTIES_PATH"
 fi
 
 for conf_name in "${!configs[@]}"; do
   resource_name=${configs[$conf_name]}
-  package_configsdir=${properties['package.configsdir']}
+  package_configsdir=${PROPERTIES['package.configsdir']}
 
   if [[ $package_configsdir ]]; then
-    conf_path=$pack_path/$package_configsdir/$conf_name
+    conf_path=$PACK_PATH/$package_configsdir/$conf_name
   else
-    conf_path=$pack_path/$conf_name
+    conf_path=$PACK_PATH/$conf_name
   fi
 
   if [[ ! -e $conf_path ]]; then
@@ -142,7 +125,7 @@ done
 
 for resource_pathleaf in "${!resources[@]}"; do
   resource_name=${resources[$resource_pathleaf]}
-  resource_path=$pack_path/$resource_pathleaf
+  resource_path=$PACK_PATH/$resource_pathleaf
   if [[ ! -e $resource_path ]]; then
     copy_resource "$resource_name" "$resource_path"
   fi
